@@ -5,11 +5,9 @@
 			<vindi>
 				<active>1</active>
 				<model>Vindi\Payment\Model\Payment\Vindi</model>
-				<allow_installments>0</allow_installments>
 				<order_status>pending</order_status>
 				<title>Vindi</title>
 				<allowspecific>0</allowspecific>
-				<payment_action>capture</payment_action>
 				<group>offline</group>
 			</vindi>
 		</payment>

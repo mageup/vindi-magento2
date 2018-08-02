@@ -7,10 +7,8 @@ use Magento\Framework\DataObject;
 use Magento\Payment\Observer\AbstractDataAssignObserver;
 use Magento\Quote\Api\Data\CartInterface;
 use Magento\Quote\Api\Data\PaymentInterface;
-use Magento\Sales\Model\Order;
 use Vindi\Payment\Block\Info\Cc;
 use Vindi\Payment\Model\Api;
-use Magento\Directory\Helper\Data as DirectoryHelper;
 
 class Vindi extends \Magento\Payment\Model\Method\AbstractMethod
 {
@@ -18,6 +16,13 @@ class Vindi extends \Magento\Payment\Model\Method\AbstractMethod
     protected $_code = "vindi";
     protected $_isOffline = true;
     protected $_infoBlockType = Cc::class;
+
+    public function isAvailable(
+        \Magento\Quote\Api\Data\CartInterface $quote = null
+    )
+    {
+        return parent::isAvailable($quote);
+    }
 
     /**
      * @var bool
@@ -67,72 +72,12 @@ class Vindi extends \Magento\Payment\Model\Method\AbstractMethod
     /**
      * @var bool
      */
-    protected $_isInitializeNeeded = false;
+    protected $_isInitializeNeeded = true;
 
     /**
      * @var bool
      */
     protected $_canSaveCc = false;
-
-    protected $_invoiceService;
-    protected $api, $order;
-
-    public function __construct(
-        \Magento\Framework\Model\Context $context,
-        \Vindi\Payment\Model\Payment\Api $api,
-        Customer $customer,
-        Product $product,
-        Bill $bill,
-        Profile $profile,
-        \Psr\Log\LoggerInterface $psrLogger,
-        \Magento\Framework\Stdlib\DateTime\TimezoneInterface $date,
-        PaymentMethod $paymentMethod,
-        \Magento\Sales\Model\Service\InvoiceService $invoiceService,
-        \Magento\Framework\Registry $registry,
-        \Magento\Framework\Api\ExtensionAttributesFactory $extensionFactory,
-        \Magento\Framework\Api\AttributeValueFactory $customAttributeFactory,
-        \Magento\Payment\Helper\Data $paymentData,
-        \Magento\Framework\App\Config\ScopeConfigInterface $scopeConfig,
-        \Magento\Payment\Model\Method\Logger $logger,
-        \Magento\Sales\Model\OrderFactory $orderFactory,
-        \Magento\Checkout\Model\Session $checkoutSession,
-        \Magento\Framework\Model\ResourceModel\AbstractResource $resource = null,
-        \Magento\Framework\Data\Collection\AbstractDb $resourceCollection = null,
-        array $data = []
-    )
-    {
-        $this->_logger = $logger;
-        parent::__construct(
-            $context,
-            $registry,
-            $extensionFactory,
-            $customAttributeFactory,
-            $paymentData,
-            $scopeConfig,
-            $logger,
-            $resource,
-            $resourceCollection,
-            $data
-        );
-
-        $this->api = $api;
-        $this->_invoiceService = $invoiceService;
-        $this->customer = $customer;
-        $this->product = $product;
-        $this->bill = $bill;
-        $this->paymentMethod = $paymentMethod;
-        $this->date = $date;
-        $this->psrLogger = $psrLogger;
-        $this->profile = $profile;
-    }
-
-
-    public function isAvailable(
-        \Magento\Quote\Api\Data\CartInterface $quote = null
-    )
-    {
-        return parent::isAvailable($quote);
-    }
 
     /**
      * Assign data to info model instance
@@ -169,109 +114,130 @@ class Vindi extends \Magento\Payment\Model\Method\AbstractMethod
     }
 
     /**
+     * @param string $paymentAction
+     * @param object $stateObject
+     *
+     * @return  VindiCreditcard
+     */
+    protected function processNewOrder($paymentAction, $stateObject)
+    {
+        $payment = $this->getInfoInstance();
+        $order = $payment->getOrder();
+
+        $customer = Mage::getModel('customer/customer');
+
+        $customerId = $this->createCustomer($order, $customer);
+        $customerVindiId = $customer->getVindiUserCode();
+
+        if (!$payment->getAdditionalInformation('use_saved_cc')) {
+            $this->createPaymentProfile($customerId);
+        } else {
+            $this->assignDataFromPreviousPaymentProfile($customerVindiId);
+        }
+
+        if ($this->isSingleOrder($order)) {
+            $result = $this->processSinglePayment($payment, $order, $customerId);
+        } else {
+            $result = $this->processSubscription($payment, $order, $customerId);
+        }
+
+        if (!$result) {
+            return false;
+        }
+
+        $billData = $this->api()->getBill($result);
+        $installments = $billData['installments'];
+        $response_fields = $billData['charges'][0]['last_transaction']['gateway_response_fields'];
+        $possible = ['nsu', 'proof_of_sale'];
+        $nsu = '';
+        foreach ($possible as $nsu_field) {
+            if ($response_fields[$nsu_field]) {
+                $nsu = $response_fields[$nsu_field];
+            }
+        }
+
+        $this->getInfoInstance()->setAdditionalInformation(
+            [
+                'installments' => $installments,
+                'nsu' => $nsu
+            ]
+        );
+
+        $stateObject->setStatus(Mage_Sales_Model_Order::STATE_PENDING_PAYMENT)
+            ->setState(Mage_Sales_Model_Order::STATE_PENDING_PAYMENT);
+
+        return $this;
+    }
+
+    /**
+     * @param int $customerId
+     *
+     * @return array|bool
+     */
+    protected function createPaymentProfile($customerId)
+    {
+        $payment = $this->getInfoInstance();
+
+        $creditCardData = [
+            'holder_name' => $payment->getCcOwner(),
+            'card_expiration' => str_pad($payment->getCcExpMonth(), 2, '0', STR_PAD_LEFT)
+                . '/' . $payment->getCcExpYear(),
+            'card_number' => $payment->getCcNumber(),
+            'card_cvv' => $payment->getCcCid() ?: '000',
+            'customer_id' => $customerId,
+            'payment_company_code' => $payment->getCcType(),
+            'payment_method_code' => $this->getPaymentMethodCode()
+        ];
+
+        $paymentProfile = $this->api()->createCustomerPaymentProfile($creditCardData);
+
+        if ($paymentProfile === false) {
+            Mage::throwException('Erro ao informar os dados de cartão de crédito. Verifique os dados e tente novamente!');
+
+            return false;
+        }
+
+        $verifyMethod = Mage::getStoreConfig('vindi_subscription/general/verify_method');
+
+        if ($verifyMethod && !$this->verifyPaymentProfile($paymentProfile['payment_profile']['id'])) {
+            Mage::throwException('Não foi possível realizar a verificação do seu cartão de crédito!');
+            return false;
+        }
+        return $paymentProfile;
+    }
+
+    /**
+     * @param int $paymentProfileId
+     *
+     * @return array|bool
+     */
+    public function verifyPaymentProfile($paymentProfileId)
+    {
+        $verify_status = $this->api()->verifyCustomerPaymentProfile($paymentProfileId);
+        return ($verify_status['transaction']['status'] === 'success');
+    }
+
+    /**
+     * @param int $customerVindiId
+     */
+    protected function assignDataFromPreviousPaymentProfile($customerVindiId)
+    {
+        $api = Mage::helper('vindi_subscription/api');
+        $savedCc = $api->getCustomerPaymentProfile($customerVindiId);
+        $info = $this->getInfoInstance();
+
+        $info->setCcType($savedCc['payment_company']['code'])
+            ->setCcOwner($savedCc['holder_name'])
+            ->setCcLast4($savedCc['card_number_last_four'])
+            ->setCcNumber($savedCc['card_number_last_four'])
+            ->setAdditionalInformation('use_saved_cc', true);
+    }
+
+    /**
      * @return string
      */
     protected function getPaymentMethodCode()
     {
         return 'credit_card';
-    }
-
-    public function validate()
-    {
-        $info = $this->getInfoInstance();
-        $quote = $info->getQuote();
-
-//        $maxInstallmentsNumber = Mage::getStoreConfig('payment/vindi_creditcard/max_installments_number');
-
-//        if ($this->isSingleOrder($quote) && ($maxInstallmentsNumber > 1)) {
-//            if (!$installments = $info->getAdditionalInformation('installments')) {
-//                return $this->error('Você deve informar o número de parcelas.');
-//            }
-//
-//            if ($installments > $maxInstallmentsNumber) {
-//                return $this->error('O número de parcelas selecionado é inválido.');
-//            }
-//
-//            $minInstallmentsValue = Mage::getStoreConfig('payment/vindi_creditcard/min_installment_value');
-//            $installmentValue = ceil($quote->getGrandTotal() / $installments * 100) / 100;
-//
-//            if (($installmentValue < $minInstallmentsValue) && ($installments > 1)) {
-//                return $this->error('O número de parcelas selecionado é inválido.');
-//            }
-//        }
-
-//        if ($info->getAdditionalInformation('use_saved_cc')) {
-//            return $this;
-//        }
-
-        $availableTypes = $this->paymentMethod->getCreditCardTypes();
-
-        $ccNumber = $info->getCcNumber();
-
-        // remove credit card non-numbers
-        $ccNumber = preg_replace('/\D/', '', $ccNumber);
-
-        $info->setCcNumber($ccNumber);
-
-        if (!$this->validateExpDate($info->getCcExpYear(), $info->getCcExpMonth())) {
-            return $this->addError(__('Incorrect credit card expiration date.'));
-        }
-
-        if (!array_key_exists(PaymentMethod::$cCBrands[$info->getCcType()], $availableTypes)) {
-            return $this->addError(__('Credit card type is not allowed for this payment method.'));
-        }
-
-        return $this;
-    }
-
-    protected function validateExpDate($expYear, $expMonth)
-    {
-        $date = $this->date->date();
-        if ($expYear && $expMonth && ($expYear > $date->format('Y'))
-            || ($date->format('Y') == $expYear && ($expMonth > $date->format('m')))
-        ) {
-            return true;
-        }
-        return false;
-    }
-
-    public function capture(\Magento\Payment\Model\InfoInterface $payment, $amount)
-    {
-        $order = $payment->getOrder();
-        $customerId = $this->customer->findOrCreate($order);
-        $paymentProfile = $this->profile->create($payment, $customerId, $this->getPaymentMethodCode());
-        $productList = $this->product->findOrCreateProducts($order);
-
-        $body = [
-            'customer_id' => $customerId,
-            'payment_method_code' => $this->getPaymentMethodCode(),
-            'bill_items' => $productList,
-            'payment_profile' => ['id' => $paymentProfile['payment_profile']['id']]
-        ];
-
-        if ($bill = $this->bill->create($body)) {
-            if (
-                $bill['code'] === PaymentMethod::BANK_SLIP
-                || $bill['code'] === PaymentMethod::DEBIT_CARD
-                || $bill['status'] === Bill::PAID_STATUS
-                || $bill['status'] === Bill::REVIEW_STATUS
-            ) {
-                $order->setVindiBillId($bill['id']);
-                $order->save();
-                return $bill['id'];
-            }
-            $this->bill->delete($bill['id']);
-        }
-
-        $this->psrLogger->error(sprintf('Erro no pagamento do pedido %d.', $order->getId()));
-        $message = "Houve um problema na confirmação do pagamento. Verifique os dados e tente novamente.";
-        $payment->setStatus(
-            Order::STATE_CANCELED,
-            Order::STATE_CANCELED,
-            $message,
-            true
-        );
-//        throw new \Exception($message);
-
     }
 }
