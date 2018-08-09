@@ -5,15 +5,20 @@
 		<payment>
 			<vindi>
 				<active>1</active>
-				<mode>2</mode>
 				<model>Vindi\Payment\Model\Payment\Vindi</model>
 				<allow_installments>0</allow_installments>
 				<order_status>pending</order_status>
 				<title>Vindi</title>
 				<allowspecific>0</allowspecific>
-				<payment_action>capture</payment_action>
+				<payment_action>authorize_capture</payment_action>
 				<group>offline</group>
 			</vindi>
 		</payment>
+		<vindiconfiguration>
+			<general>
+				<mode>2</mode>
+				<test>values</test>
+			</general>
+		</vindiconfiguration>
 	</default>
 </config>
